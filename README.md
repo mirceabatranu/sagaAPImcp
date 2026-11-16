@@ -16,17 +16,89 @@ neoficial, fără legătură cu SAGA Soft.
 | `saga_stoc_articol` | Stocul unui articol, opțional pe gestiune | Nu |
 | `saga_situatie_stocuri` | Situația stocurilor pe o perioadă | Nu |
 | `saga_articol` | Fișa unui articol | Nu |
+| `saga_compara_sold` | Compară soldul unui cont cu o valoare externă (extras, registru de casă, fișa ANAF) | Nu |
+| `saga_furnizori` | Furnizorii cunoscuți (registru local + balanța analitică) și verificarea „există / e nou” | Nu |
 | `saga_status` | Configurarea: adresa API, cheile salvate | Nu |
-| `saga_pregateste_import` | Construiește fișierul XML de import (F, C, I, P, NC, CLI, ART) și îl salvează local | Nu |
+| `saga_pregateste_import` | Construiește un fișier XML de import (F, C, I, P, NC, CLI, ART) și îl salvează local | Nu |
+| `saga_pregateste_bonuri` | Bonuri fiscale → furnizori (date de la ANAF) + bonuri + plăți legate de bonuri | Nu |
+| `saga_pregateste_extras` | Extras de cont → încasări, plăți și note contabile, cu verificarea soldurilor | Nu |
 | `saga_importa` | Trimite fișierul în SAGA, **în doi pași, cu confirmarea ta** | Da |
 
-Resursa `saga://formate-import` conține structura fișierelor XML de import.
+Resurse: `saga://formate-import` (structura fișierelor XML) și `saga://categorii-extras`
+(cum se înregistrează fiecare tip de tranzacție bancară).
 
 Exemple de întrebări pentru Claude:
 
 - „Cât am în casă azi la firma 43424557?”
 - „Arată-mi TVA-ul de plată din balanța pe octombrie pentru toți clienții din lista asta.”
-- „Fă nota contabilă pentru bonurile de combustibil din tabelul ăsta și pregătește importul.”
+- „Introdu bonurile din pozele astea pentru 43424557.”
+- „Introdu extrasul ăsta de cont și verifică dacă se leagă cu soldul din SAGA.”
+
+## Flux: bonuri fiscale
+
+1. **Identificare.** Claude citește pozele bonurilor: CIF și denumire emitent, număr, dată,
+   total, TVA pe cote, mod de plată, dacă apare CIF-ul firmei pe bon. Îți arată un tabel.
+2. **Furnizori.** `saga_pregateste_bonuri` caută fiecare furnizor la ANAF (denumire oficială,
+   Reg. Com., adresă) și îl compară cu furnizorii cunoscuți. Îți arată care sunt noi și
+   semnalează furnizorii **inactivi** sau radiați.
+3. **Bonuri.** Construiește fișierul `F_...` cu bonurile ca documente de intrare de tip `B`
+   (bon de casă), fiecare cu un identificator unic. Furnizorii noi se creează în SAGA odată
+   cu bonul.
+4. **Plăți.** Construiește fișierul `P_...` cu plata fiecărui bon, legată de bon prin
+   identificator, pe contul modului de plată:
+
+   | Plată | Cont |
+   |---|---|
+   | numerar | 5311 |
+   | card | 5121 |
+   | angajat (din banii lui) | 542 |
+   | neplătit | fără plată |
+
+5. **Import.** Mai întâi `F_` (îl finalizezi în SAGA), apoi `P_`.
+
+TVA-ul se trece automat ca nedeductibil (`TipDeducere = I`) la furnizorii inactivi și la
+bonurile fără CIF-ul firmei. Pentru combustibil poți cere deducere 50% (`N50`). Un bon deja
+importat (același furnizor, număr și dată) nu mai poate fi introdus a doua oară.
+
+## Flux: extras de cont
+
+1. Claude citește extrasul (PDF, CSV sau MT940) și încadrează fiecare tranzacție:
+
+   | Categorie | Înregistrare |
+   |---|---|
+   | încasare client | încasare (`I_`), 5121 / 4111, legată de factură |
+   | plată furnizor | plată (`P_`), 401 / 5121, legată de factură |
+   | comision bancar | 627 = 5121 |
+   | dobândă | 5121 = 766 |
+   | plată la stat | 4423 / 4411 / 444 / 431 … = 5121 |
+   | salarii | 421 = 5121 |
+   | retragere numerar | 581 = 5121, 5311 = 581 |
+   | depunere numerar | 581 = 5311, 5121 = 581 |
+   | transfer între conturi | prin 581 |
+   | altă operațiune | cu contul ales de tine |
+
+2. **Verificări**, înainte de orice import:
+   - sold inițial + tranzacții = sold final, adică nu lipsește nimic din extras;
+   - soldul din SAGA în ziua dinaintea extrasului = soldul inițial, adică extrasele
+     anterioare sunt introduse;
+   - tranzacțiile deja importate sunt sărite.
+3. Import pe rând (`I_`, `P_`, `NC_`), apoi `saga_compara_sold` pe contul bancar la data
+   finală.
+
+## Registrul local
+
+API-ul SAGA nu are o listă de parteneri și nu spune ce documente există deja. Serverul ține
+pentru fiecare firmă un fișier `Documents\SAGA\<cif>\registru.json` cu:
+- furnizorii importați prin el;
+- furnizorii din balanța analitică;
+- identificatorii bonurilor și tranzacțiilor importate.
+
+Dacă lucrați mai mulți pe aceeași firmă, de pe calculatoare diferite, setați `SAGA_DATA_DIR`
+la un folder comun (rețea, OneDrive), ca registrul să fie același.
+
+**De verificat la primul import real:**
+- Cel mai probabil SAGA potrivește furnizorul după CIF. Asta trebuie confirmat.
+- Plățile din `P_` trebuie să apară legate de bonuri (bonuri achitate).
 
 ## Siguranță
 
