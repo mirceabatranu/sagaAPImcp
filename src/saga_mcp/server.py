@@ -13,7 +13,7 @@ from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from . import anaf, client, formats, keystore, workflows
+from . import anaf, client, closing, formats, keystore, workflows
 from .registry import Registry
 
 DATA_DIR = Path(os.environ.get("SAGA_DATA_DIR", Path.home() / "Documents" / "SAGA"))
@@ -708,6 +708,171 @@ async def saga_compara_sold(
     dif = workflows.r2(sold - sold_asteptat)
     return {"cif": c, "cont": cont, "data": d, "sold_saga": sold, "sold_asteptat": sold_asteptat,
             "diferenta": dif, "concorda": abs(dif) < 0.01}
+
+
+# --------------------------------------------------------------------------- cabinet
+def _clients_path() -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return DATA_DIR / "clienti.json"
+
+
+def _load_clients() -> dict:
+    p = _clients_path()
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def _save_clients(data: dict) -> None:
+    _clients_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@mcp.tool()
+async def saga_configureaza_client(
+    cif: str,
+    denumire: str | None = None,
+    tva: Literal["lunar", "trimestrial", "neplatitor"] | None = None,
+    declaratii: dict[str, str] | None = None,
+    conturi_banca: list[str] | None = None,
+    plafon_casa: float | None = None,
+    responsabil: str | None = None,
+    descoperit_permis: bool | None = None,
+    sterge: bool = False,
+) -> dict:
+    """Adauga sau modifica o firma in lista clientilor cabinetului (folosita la inchiderea lunii).
+
+    Se modifica doar campurile date; restul raman cum erau.
+
+    Args:
+        cif: codul fiscal al firmei.
+        denumire: numele firmei (daca lipseste, se ia de la ANAF la prima adaugare).
+        tva: "lunar", "trimestrial" sau "neplatitor".
+        declaratii: declaratiile de urmarit si periodicitatea lor, ex.
+            {"D300": "lunar", "D394": "lunar", "D112": "lunar", "D100": "trimestrial", "D406": "lunar"}.
+        conturi_banca: conturile bancare de verificat (implicit ["5121"]).
+        plafon_casa: plafonul de casa (implicit 50000).
+        responsabil: contabilul care se ocupa de firma.
+        descoperit_permis: true daca firma are descoperit de cont (banca negativa nu e eroare).
+        sterge: true ca sa scoti firma din lista.
+    """
+    c = client.norm_cif(cif)
+    data = _load_clients()
+    if sterge:
+        removed = data.pop(c, None)
+        _save_clients(data)
+        return {"sters": bool(removed), "cif": c}
+    entry = data.get(c, {"cif": c})
+    if not entry.get("denumire") and not denumire:
+        try:
+            denumire = (await anaf.lookup([c])).get(c, {}).get("denumire")
+        except Exception:  # noqa: BLE001
+            pass
+    updates = {"denumire": denumire, "tva": tva, "declaratii": declaratii, "conturi_banca": conturi_banca,
+               "plafon_casa": plafon_casa, "responsabil": responsabil, "descoperit_permis": descoperit_permis}
+    for k, v in updates.items():
+        if v is not None:
+            entry[k] = v
+    if declaratii:
+        bad = [f"{k}: {v}" for k, v in declaratii.items() if v not in closing.PERIODICITY]
+        if bad:
+            raise ValueError(f"Periodicitate invalida ({', '.join(bad)}). Valori: {', '.join(closing.PERIODICITY)}")
+    data[c] = entry
+    _save_clients(data)
+    return {"salvat": entry, "fisier": str(_clients_path())}
+
+
+@mcp.tool()
+async def saga_clienti() -> dict:
+    """Lista firmelor din cabinet, cu configurarea lor pentru inchiderea lunii."""
+    data = _load_clients()
+    return {"numar": len(data), "firme": list(data.values()), "fisier": str(_clients_path())}
+
+
+@mcp.tool()
+async def saga_inchidere_luna(
+    an: int,
+    luna: int,
+    cif_uri: list[str] | None = None,
+    mesaje_spv: list[dict] | None = None,
+    date_anaf: dict[str, dict] | None = None,
+    solduri_extras: dict[str, dict[str, float]] | None = None,
+    azi: str | None = None,
+) -> dict:
+    """Raportul de inchidere a lunii pentru toti clientii cabinetului (sau doar cif_uri).
+
+    Pentru fiecare firma verifica in SAGA, la ultima zi a lunii: casa (negativa, peste
+    plafon), banca (negativa, egala cu extrasul), TVA regularizat (4426/4427 = 0) si 4423
+    fata de D300. Cu datele din SPV verifica declaratiile depuse si datoriile la ANAF.
+    Rezultat: starea fiecarei firme (Gata / De lucru / Eroare) plus un raport HTML si CSV.
+
+    Datele ANAF se aduna INAINTE, cu anafpy, pentru firmele din lista:
+    - mesaje_spv: mesajele din spv_lista_mesaje (ultimele 60 de zile), asa cum vin;
+      recipisele de tip "recipisa pentru CIF X, tip D300, ... perioada raportare 10.2026"
+      sunt citite automat;
+    - date_anaf: {cif: {"obligatii_plata": total din cererea "Obligatii de plata",
+      "d300_de_plata": TVA de plata din D300 al lunii, "observatii": [..]}}.
+    Fara ele raportul contine doar verificarile din SAGA.
+
+    Args:
+        an: anul inchiderii, ex. 2026.
+        luna: luna inchiderii (1-12).
+        cif_uri: doar aceste firme (implicit toate din saga_clienti).
+        mesaje_spv: mesajele SPV brute de la anafpy.
+        date_anaf: date ANAF pe firma, vezi mai sus.
+        solduri_extras: soldurile de la sfarsitul lunii de pe extrase,
+            ex. {"43424557": {"5121": 24236.0}}.
+        azi: data de referinta pentru termene (implicit azi).
+    """
+    clients = _load_clients()
+    wanted = [client.norm_cif(x) for x in cif_uri] if cif_uri else list(clients)
+    if not wanted:
+        raise RuntimeError("Nu exista firme configurate. Adauga-le cu saga_configureaza_client.")
+    ref = datetime.strptime(client.norm_date(azi), "%d.%m.%Y").date() if azi else datetime.now().date()
+    end = closing.last_day(an, luna).strftime("%d.%m.%Y")
+    filed = closing.filed_from_spv(mesaje_spv) if mesaje_spv is not None else None
+
+    rezultate = []
+    for c in wanted:
+        cfg = clients.get(c, {"cif": c})
+        accounts = [("5311", "D")] + [(b, "D") for b in cfg.get("conturi_banca") or ["5121"]] + \
+                   [("4423", "C"), ("4424", "D"), ("4426", "D"), ("4427", "C")]
+        solduri, eroare_firma = {}, None
+        for cont, tip in accounts:
+            try:
+                resp = await client.get_json("Situatii/GetSoldCont", c, {"data": end, "cont": cont, "tip": tip})
+                solduri[cont] = workflows.r2(float(resp.get("data") or 0))
+            except Exception as exc:  # noqa: BLE001
+                solduri[cont] = None
+                if "401" in str(exc) or "403" in str(exc) or "cheie" in str(exc).lower():
+                    eroare_firma = str(exc)
+                    break
+        if eroare_firma:
+            rezultate.append({"cif": c, "denumire": cfg.get("denumire", ""), "responsabil": cfg.get("responsabil", ""),
+                              "stare": "Eroare", "de_rezolvat": [f"Acces SAGA: {eroare_firma}"],
+                              "verificari": [{"cod": "acces", "stare": "eroare", "mesaj": f"Acces SAGA: {eroare_firma}"}]})
+            continue
+        depuse = filed.get(c, set()) if filed is not None else None
+        rezultate.append(closing.evaluate_firm(
+            cfg, an, luna, solduri, (date_anaf or {}).get(c), depuse, ref, (solduri_extras or {}).get(c)))
+
+    folder = DATA_DIR / "rapoarte"
+    folder.mkdir(parents=True, exist_ok=True)
+    # Un raport doar pe cateva firme nu suprascrie raportul pe tot cabinetul.
+    stamp = f"{an}-{luna:02d}" if not cif_uri else f"{an}-{luna:02d}_" + "-".join(wanted[:3]) + \
+        (f"-si-alte-{len(wanted) - 3}" if len(wanted) > 3 else "")
+    html_path = folder / f"inchidere_{stamp}.html"
+    csv_path = folder / f"inchidere_{stamp}.csv"
+    html_path.write_text(closing.report_html(an, luna, rezultate, datetime.now().strftime("%d.%m.%Y %H:%M")),
+                         encoding="utf-8")
+    csv_path.write_text(closing.report_csv(rezultate), encoding="utf-8-sig")
+
+    return {
+        "luna": f"{luna:02d}.{an}",
+        "sumar": {k: sum(1 for r in rezultate if r["stare"] == k) for k in ("Eroare", "De lucru", "Gata")},
+        "firme": [{"cif": r["cif"], "denumire": r["denumire"], "responsabil": r["responsabil"],
+                   "stare": r["stare"], "de_rezolvat": r["de_rezolvat"]} for r in rezultate],
+        "date_spv_folosite": filed is not None,
+        "raport_html": str(html_path),
+        "raport_csv": str(csv_path),
+    }
 
 
 @mcp.resource("saga://categorii-extras", mime_type="text/markdown")

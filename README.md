@@ -18,6 +18,8 @@ neoficial, fără legătură cu SAGA Soft.
 | `saga_articol` | Fișa unui articol | Nu |
 | `saga_compara_sold` | Compară soldul unui cont cu o valoare externă (extras, registru de casă, fișa ANAF) | Nu |
 | `saga_furnizori` | Furnizorii cunoscuți (registru local + balanța analitică) și verificarea „există / e nou” | Nu |
+| `saga_configureaza_client` / `saga_clienti` | Lista firmelor cabinetului: TVA, declarații, conturi bancare, responsabil | Nu |
+| `saga_inchidere_luna` | Raportul de închidere a lunii pe toți clienții (Gata / De lucru / Eroare), HTML + CSV | Nu |
 | `saga_status` | Configurarea: adresa API, cheile salvate | Nu |
 | `saga_pregateste_import` | Construiește un fișier XML de import (F, C, I, P, NC, CLI, ART) și îl salvează local | Nu |
 | `saga_pregateste_bonuri` | Bonuri fiscale → furnizori (date de la ANAF) + bonuri + plăți legate de bonuri | Nu |
@@ -84,6 +86,52 @@ importat (același furnizor, număr și dată) nu mai poate fi introdus a doua o
    - tranzacțiile deja importate sunt sărite.
 3. Import pe rând (`I_`, `P_`, `NC_`), apoi `saga_compara_sold` pe contul bancar la data
    finală.
+
+## Flux: închiderea lunii pe toți clienții
+
+Un raport pe care îl rulezi la început de lună și care răspunde la întrebarea: *la care
+firme e totul gata pe luna trecută și unde mai e de lucru?*
+
+**1. Configurezi o dată lista clienților** (îi spui lui Claude, de exemplu: „adaugă firma
+12345678, TVA lunar, D300, D394 și D112 lunar, D100 trimestrial, responsabil Ana”):
+
+```
+saga_configureaza_client(cif, tva, declaratii, conturi_banca, plafon_casa, responsabil)
+```
+
+Lista se salvează în `Documents\SAGA\clienti.json`.
+
+**2. La început de lună** îi ceri lui Claude „închiderea pe octombrie”. Claude:
+- ia din SPV (cu anafpy) recipisele din ultimele 60 de zile și obligațiile de plată ale
+  fiecărei firme;
+- rulează `saga_inchidere_luna`.
+
+**Ce se verifică la fiecare firmă**, la ultima zi a lunii:
+
+| Verificare | Sursa | Eroare / Atenție |
+|---|---|---|
+| Casa (5311) | SAGA | sold negativ (eroare); peste plafon (atenție) |
+| Banca (5121 sau alte conturi) | SAGA + extrase | sold negativ (eroare); diferit de extras (atenție) |
+| TVA regularizat | SAGA 4426 / 4427 | ≠ 0 în luna de decont |
+| TVA vs D300 | SAGA 4423 + D300 | diferență |
+| Declarații depuse | recipisele din SPV | lipsă (atenție), lipsă după termen (eroare) |
+| Datorii ANAF | „Obligatii de plata” din SPV | sumă de plată |
+| Acces | SAGA | firma nu e accesibilă cu cheia (eroare) |
+
+Plătitorii trimestriali de TVA sunt verificați doar în lunile de sfârșit de trimestru, iar
+declarațiile trimestriale doar în lunile 3, 6, 9 și 12.
+
+**3. Rezultatul**:
+- o listă cu starea fiecărei firme (**Gata / De lucru / Eroare**) și ce e de rezolvat;
+- `Documents\SAGA\rapoarte\inchidere_AAAA-LL.html`: raport de deschis în browser, pentru tot
+  cabinetul, ordonat cu erorile primele;
+- `inchidere_AAAA-LL.csv`: același raport pentru Excel.
+
+Un raport doar pe câteva firme primește alt nume și nu îl suprascrie pe cel al cabinetului.
+
+**De verificat pe date reale:**
+- dacă un sold negativ (casă, bancă) vine ca număr negativ la `tip=D`;
+- dacă certificatul are împuterniciri SPV pe clienți, altfel partea ANAF lipsește pentru ei.
 
 ## Registrul local
 

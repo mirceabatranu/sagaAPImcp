@@ -55,6 +55,14 @@ def anaf_found(cui, nume, inactiv=False, tva=True):
     }
 
 
+# Solduri pe (cif, cont) pentru inchiderea lunii; restul conturilor = 0.
+SOLDURI = {
+    ("43424557", "5311"): "24571.00", ("43424557", "5121"): "24571.00", ("43424557", "4423"): "830.00",
+    ("11111111", "5311"): "-150.00", ("11111111", "5121"): "1000.00",
+    ("33333333", "5311"): "100.00", ("33333333", "5121"): "500.00", ("33333333", "4426"): "300.00",
+}
+FORBIDDEN_CIF = "44444444"
+
 ANAF = {
     1590082: anaf_found(1590082, "OMV PETROM MARKETING SRL"),
     2222222: anaf_found(2222222, "FIRMA INACTIVA SRL", inactiv=True),
@@ -87,6 +95,9 @@ class Saga(BaseHTTPRequestHandler):
         state["log"].append(("GET", u.path, q, self.headers.get("X-Saga-Cod-Fiscal")))
         if not self._auth():
             return
+        if self.headers.get("X-Saga-Cod-Fiscal") == FORBIDDEN_CIF:
+            self._send(403, {"success": False, "message": "fara drepturi"})
+            return
         if u.path.endswith("/Situatii/GetBalanta") and q.get("tipBalanta") == "1":
             self._send(200, BALANTA_ANALITICA, "application/xml")
         elif u.path.endswith("/Situatii/GetBalanta"):
@@ -95,7 +106,8 @@ class Saga(BaseHTTPRequestHandler):
             state["key"] = f"KEY-{state['rotations'] + 1}"
             self._send(200, BALANTA, "application/xml", {"X-Saga-Refresh-Token": state["key"]})
         elif u.path.endswith("/Situatii/GetSoldCont"):
-            self._send(200, {"success": True, "message": "", "data": "24571.00"})
+            val = SOLDURI.get((self.headers.get("X-Saga-Cod-Fiscal"), q.get("cont")), "0")
+            self._send(200, {"success": True, "message": "", "data": val})
         elif u.path.endswith("/Situatii/GetStocArticol"):
             if "data" in q and q["data"].count(".") != 2:
                 self._send(400, {"success": False, "error": "Data trebuie sa fie in formatul dd.MM.yyyy."})
@@ -298,6 +310,60 @@ async def main():
                 err, out = await call("saga_compara_sold", {"cif": "43424557", "cont": "5121", "data": "2026-11-30",
                                                              "sold_asteptat": 24236})
                 check(not err and out["diferenta"] == 335 and out["concorda"] is False, "compara sold")
+
+                # ---------------- inchiderea lunii ----------------
+                err, out = await call("saga_configureaza_client", {
+                    "cif": "43424557", "tva": "lunar", "responsabil": "Ana",
+                    "declaratii": {"D300": "lunar", "D100": "trimestrial"}})
+                check(not err and out["salvat"]["denumire"] == "ANGAJEAZA UN ROBOT SRL", "client nou, denumire de la ANAF")
+                await call("saga_configureaza_client", {"cif": "11111111", "denumire": "FIRMA B SRL", "tva": "lunar",
+                                                        "declaratii": {"D300": "lunar", "D112": "lunar"}})
+                await call("saga_configureaza_client", {"cif": "33333333", "denumire": "FIRMA C SRL",
+                                                        "tva": "trimestrial", "declaratii": {"D112": "lunar"}})
+                await call("saga_configureaza_client", {"cif": "44444444", "denumire": "FIRMA D SRL"})
+                err, out = await call("saga_configureaza_client", {"cif": "1", "declaratii": {"D300": "saptamanal"}})
+                check(err and "Periodicitate" in out, "periodicitate invalida refuzata")
+                await call("saga_configureaza_client", {"cif": "1", "sterge": True})
+                err, out = await call("saga_clienti", {})
+                check(not err and out["numar"] == 4, "lista clientilor cabinetului")
+
+                mesaje = [
+                    {"id": "1", "details": "recipisa pentru CIF 43424557, tip D300, numar_inregistrare INTERNT-1/25-11-2026, perioada raportare 10.2026"},
+                    {"id": "2", "details": "recipisa pentru CIF 33333333, tip D112, numar_inregistrare INTERNT-2/20-11-2026, perioada raportare 10.2026"},
+                    {"id": "3", "details": "recipisa pentru CIF 11111111, tip D300, numar_inregistrare INTERNT-3/25-10-2026, perioada raportare 9.2026"},
+                ]
+                err, out = await call("saga_inchidere_luna", {
+                    "an": 2026, "luna": 10, "mesaje_spv": mesaje, "azi": "2026-11-26",
+                    "date_anaf": {"43424557": {"obligatii_plata": 0, "d300_de_plata": 830},
+                                  "11111111": {"obligatii_plata": 1240}},
+                    "solduri_extras": {"43424557": {"5121": 24571}, "33333333": {"5121": 800}}})
+                check(not err, f"inchiderea lunii {'' if not err else out}")
+                if not err:
+                    st = {f["cif"]: f for f in out["firme"]}
+                    check(out["sumar"] == {"Eroare": 2, "De lucru": 1, "Gata": 1}, f"sumar {out['sumar']}")
+                    check(st["43424557"]["stare"] == "Gata", "firma A: totul in regula -> Gata")
+                    b = " | ".join(st["11111111"]["de_rezolvat"])
+                    check(st["11111111"]["stare"] == "Eroare" and "negativ" in b and "D300 nedepusa, termen depasit" in b
+                          and "D112" in b and "1240" in b, "firma B: casa negativa, D300/D112 lipsa (recipisa pe 09 nu conteaza), datorii")
+                    c_ = " | ".join(st["33333333"]["de_rezolvat"])
+                    check(st["33333333"]["stare"] == "De lucru" and "difera de extras" in c_ and "4426" not in c_,
+                          "firma C: extras neintrodus; TVA trimestrial nu se cere in octombrie")
+                    check(st["44444444"]["stare"] == "Eroare" and "403" in st["44444444"]["de_rezolvat"][0],
+                          "firma D: fara drepturi in SAGA")
+                    sold_dates = {l[2].get("data") for l in state["log"]
+                                  if l[0] == "GET" and l[1].endswith("GetSoldCont") and l[3] == "11111111"}
+                    check(sold_dates == {"31.10.2026"}, "solduri citite la ultima zi a lunii")
+                    h = open(out["raport_html"], encoding="utf-8").read()
+                    check("Eroare: 2" in h and "FIRMA B SRL" in h and os.path.exists(out["raport_csv"]),
+                          "raport HTML si CSV generate")
+                    full_report = out["raport_html"]
+                    print("Raport:", full_report)
+                err, out = await call("saga_inchidere_luna", {"an": 2026, "luna": 10, "cif_uri": ["43424557"],
+                                                              "azi": "2026-11-10"})
+                check(not err and out["date_spv_folosite"] is False and out["firme"][0]["stare"] == "Gata",
+                      "fara date SPV: doar verificarile din SAGA")
+                check(not err and out["raport_html"] != full_report and "FIRMA B SRL" in open(full_report, encoding="utf-8").read(),
+                      "raportul pe o firma nu suprascrie raportul cabinetului")
     finally:
         for slot in ("default",):
             try:
